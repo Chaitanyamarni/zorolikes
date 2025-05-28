@@ -11,21 +11,37 @@ import like_pb2
 import like_count_pb2
 import uid_generator_pb2
 from google.protobuf.message import DecodeError
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 app = Flask(__name__)
 
 def load_tokens(server_name):
     try:
         if server_name == "IND":
-            with open("token_ind.json", "r") as f:
-                tokens = json.load(f)
+            file_path = "token_ind.json"
         elif server_name in {"BR", "US", "SAC", "NA"}:
-            with open("token_br.json", "r") as f:
-                tokens = json.load(f)
+            file_path = "token_br.json"
         else:
-            with open("token_bd.json", "r") as f:
-                tokens = json.load(f)
-        return tokens
+            file_path = "token_bd.json"
+            
+        with open(file_path, "r") as f:
+            tokens = json.load(f)
+            
+        # Validate tokens structure
+        if not isinstance(tokens, list):
+            raise ValueError("Tokens file should contain a list")
+            
+        valid_tokens = []
+        for token in tokens:
+            if isinstance(token, dict) and 'token' in token and token['token']:
+                valid_tokens.append(token)
+                
+        if not valid_tokens:
+            raise ValueError("No valid tokens found in file")
+            
+        return valid_tokens
+        
     except Exception as e:
         app.logger.error(f"Error loading tokens for server {server_name}: {e}")
         return None
@@ -61,10 +77,11 @@ async def send_request(encrypted_uid, token, url):
             'Accept-Encoding': "gzip",
             'Authorization': f"Bearer {token}",
             'Content-Type': "application/x-www-form-urlencoded",
-            'Expect': "100-continue",                                                               'X-Unity-Version': "2018.4.11f1",
+            'Expect': "100-continue",
+            'X-Unity-Version': "2018.4.11f1",
             'X-GA': "v1 1",
             'ReleaseVersion': "OB49"
-            }
+        }
         
         async with aiohttp.ClientSession() as session:
             async with session.post(url, data=edata, headers=headers) as response:
@@ -118,7 +135,7 @@ def enc(uid):
     encrypted_uid = encrypt_message(protobuf_data)
     return encrypted_uid
 
-def make_request(encrypt, server_name, token):
+def make_request(encrypt, server_name, token, timeout=10):
     try:
         if server_name == "IND":
             url = "https://client.ind.freefiremobile.com/GetPlayerPersonalShow"
@@ -126,6 +143,7 @@ def make_request(encrypt, server_name, token):
             url = "https://client.us.freefiremobile.com/GetPlayerPersonalShow"
         else:
             url = "https://clientbp.ggblueshark.com/GetPlayerPersonalShow"
+            
         edata = bytes.fromhex(encrypt)
         headers = {
             'User-Agent': "Dalvik/2.1.0 (Linux; U; Android 9; ASUS_Z01QD Build/PI)",
@@ -138,13 +156,32 @@ def make_request(encrypt, server_name, token):
             'X-GA': "v1 1",
             'ReleaseVersion': "OB49"
         }
-        response = requests.post(url, data=edata, headers=headers, verify=False)
-        hex_data = response.content.hex()
-        binary = bytes.fromhex(hex_data)
-        decode = decode_protobuf(binary)
-        if decode is None:
-            app.logger.error("Protobuf decoding returned None.")
-        return decode
+        
+        # Configure retry strategy
+        retry_strategy = Retry(
+            total=3,
+            backoff_factor=1,
+            status_forcelist=[408, 429, 500, 502, 503, 504]
+        )
+        adapter = HTTPAdapter(max_retries=retry_strategy)
+        
+        with requests.Session() as session:
+            session.mount("https://", adapter)
+            response = session.post(
+                url,
+                data=edata,
+                headers=headers,
+                verify=True,
+                timeout=timeout
+            )
+            
+            if response.status_code != 200:
+                raise Exception(f"Server returned status code {response.status_code}")
+                
+            hex_data = response.content.hex()
+            binary = bytes.fromhex(hex_data)
+            return decode_protobuf(binary)
+            
     except Exception as e:
         app.logger.error(f"Error in make_request: {e}")
         return None
@@ -170,22 +207,38 @@ def handle_requests():
 
     try:
         def process_request():
+            # Load tokens with better error handling
             tokens = load_tokens(server_name)
-            if tokens is None:
-                raise Exception("Failed to load tokens.")
-            token = tokens[0]['token']
-            encrypted_uid = enc(uid)
-            if encrypted_uid is None:
-                raise Exception("Encryption of UID failed.")
-
-            # الحصول على بيانات اللاعب قبل تنفيذ عملية الإعجاب
-            before = make_request(encrypted_uid, server_name, token)
-            if before is None:
-                raise Exception("Failed to retrieve initial player info.")
+            if not tokens or not isinstance(tokens, list) or len(tokens) == 0:
+                raise Exception(f"No valid tokens found for server {server_name}")
+                
+            # Use multiple tokens in case first one fails
+            successful_request = None
+            last_error = None
+            
+            for token_data in tokens[:3]:  # Try first 3 tokens
+                token = token_data['token']
+                encrypted_uid = enc(uid)
+                if encrypted_uid is None:
+                    continue  # Try next token if encryption fails
+                
+                try:
+                    before = make_request(encrypted_uid, server_name, token)
+                    if before is not None:
+                        successful_request = before
+                        break
+                except Exception as e:
+                    last_error = str(e)
+                    app.logger.warning(f"Request with token failed: {e}")
+                    continue
+            
+            if successful_request is None:
+                raise Exception(f"All token attempts failed. Last error: {last_error or 'Unknown error'}")
+            
             try:
-                jsone = MessageToJson(before)
+                jsone = MessageToJson(successful_request)
             except Exception as e:
-                raise Exception(f"Error converting 'before' protobuf to JSON: {e}")
+                raise Exception(f"Error converting protobuf to JSON: {e}")
             data_before = json.loads(jsone)
             before_like = data_before.get('AccountInfo', {}).get('Likes', 0)
             try:
@@ -194,7 +247,7 @@ def handle_requests():
                 before_like = 0
             app.logger.info(f"Likes before command: {before_like}")
 
-            # تحديد رابط الإعجاب حسب اسم السيرفر
+            # Determine the like URL based on server name
             if server_name == "IND":
                 url = "https://client.ind.freefiremobile.com/LikeProfile"
             elif server_name in {"BR", "US", "SAC", "NA"}:
@@ -202,13 +255,24 @@ def handle_requests():
             else:
                 url = "https://clientbp.ggblueshark.com/LikeProfile"
 
-            # إرسال الطلبات بشكل غير متزامن
+            # Send async like requests
             asyncio.run(send_multiple_requests(uid, server_name, url))
 
-            # الحصول على بيانات اللاعب بعد تنفيذ عملية الإعجاب
-            after = make_request(encrypted_uid, server_name, token)
+            # Get player info after sending likes
+            after = None
+            for token_data in tokens[:3]:  # Try first 3 tokens again
+                token = token_data['token']
+                try:
+                    after = make_request(encrypted_uid, server_name, token)
+                    if after is not None:
+                        break
+                except Exception as e:
+                    app.logger.warning(f"Post-like request failed: {e}")
+                    continue
+            
             if after is None:
-                raise Exception("Failed to retrieve player info after like requests.")
+                raise Exception("Failed to retrieve player info after like requests")
+                
             try:
                 jsone_after = MessageToJson(after)
             except Exception as e:
